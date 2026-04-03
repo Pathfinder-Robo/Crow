@@ -57,7 +57,7 @@ namespace crow // NOTE: Already documented in "crow/app.h"
                     case '\r': ret += "\\r"; break;
                     case '\t': ret += "\\t"; break;
                     default:
-                        if (c >= 0 && c < 0x20)
+                        if (static_cast<unsigned char>(c) < 0x20)
                         {
                             ret += "\\u00";
                             ret += to_hex(c / 16);
