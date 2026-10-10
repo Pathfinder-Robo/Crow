@@ -1,3 +1,10 @@
+/**
+ * @file http_connection.h
+ * @brief Crow HTTP connection handler managing request parsing, socket I/O, static file streaming,
+ *        and TCP-level traffic shaping (SO_SNDBUF, SO_MAX_PACING_RATE).
+ *        Crow HTTP 连接处理器，负责 HTTP 请求解析、Socket I/O、静态大文件流式发送以及 TCP 层流控调步。
+ */
+
 #pragma once
 
 #ifdef CROW_USE_BOOST
@@ -13,7 +20,14 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <thread>
 #include <vector>
+#ifdef __linux__
+#include <sys/socket.h>
+#ifndef SO_MAX_PACING_RATE
+#define SO_MAX_PACING_RATE 47
+#endif
+#endif
 
 #include "crow/http_parser_merged.h"
 #include "crow/common.h"
@@ -292,16 +306,48 @@ namespace crow
 
         void do_write_static()
         {
+            auto socket_start = std::chrono::steady_clock::now();
+            size_t total_transferred = 0;
+
+            int native_fd = -1;
+            try {
+                native_fd = adaptor_.raw_socket().native_handle();
+            } catch (...) {}
+
+            if (res.sndbuf_size > 0)
+            {
+                error_code ec_opt;
+                adaptor_.socket().set_option(asio::socket_base::send_buffer_size(res.sndbuf_size), ec_opt);
+                if (native_fd >= 0)
+                {
+                    int val = static_cast<int>(res.sndbuf_size);
+                    ::setsockopt(native_fd, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val));
+                }
+            }
+
+#ifdef __linux__
+            if (res.rate_limit_bytes_per_sec > 0 && native_fd >= 0)
+            {
+                unsigned long pacing_rate = static_cast<unsigned long>(res.rate_limit_bytes_per_sec);
+                if (::setsockopt(native_fd, SOL_SOCKET, SO_MAX_PACING_RATE, &pacing_rate, sizeof(pacing_rate)) < 0)
+                {
+                    CROW_LOG_WARNING << "Failed to set SO_MAX_PACING_RATE on socket " << native_fd << ": " << strerror(errno);
+                }
+            }
+#endif
+
             asio::write(adaptor_.socket(), buffers_);
 
             if (res.file_info.statResult == 0)
             {
                 std::ifstream is(res.file_info.path.c_str(), std::ios::in | std::ios::binary);
                 std::vector<asio::const_buffer> buffers{1};
-                char buf[16384];
+                char buf[8192];
                 is.read(buf, sizeof(buf));
+                auto transfer_start = std::chrono::steady_clock::now();
                 while (is.gcount() > 0)
                 {
+                    total_transferred += is.gcount();
                     buffers[0] = asio::buffer(buf, is.gcount());
                     error_code ec = do_write_sync(buffers);
                     if (ec) {
@@ -309,9 +355,30 @@ namespace crow
                                        << res.file_info.path << ". Writing stopped premature.";
                         break;
                     }
+
+                    // 双保险流控：即使底层已配置 SO_MAX_PACING_RATE，在应用层也进行时间片校准，彻底防止网卡突发倾泻
+                    if (res.rate_limit_bytes_per_sec > 0)
+                    {
+                        auto now = std::chrono::steady_clock::now();
+                        double elapsed_sec = std::chrono::duration<double>(now - transfer_start).count();
+                        double expected_sec = static_cast<double>(total_transferred) / static_cast<double>(res.rate_limit_bytes_per_sec);
+                        if (expected_sec > elapsed_sec)
+                        {
+                            auto sleep_dur = std::chrono::duration<double>(expected_sec - elapsed_sec);
+                            std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(sleep_dur));
+                        }
+                    }
+
                     is.read(buf, sizeof(buf));
                 }
             }
+            auto socket_end = std::chrono::steady_clock::now();
+            int64_t socket_dur_us = std::chrono::duration_cast<std::chrono::microseconds>(socket_end - socket_start).count();
+            if (res.on_socket_complete_)
+            {
+                res.on_socket_complete_(total_transferred, socket_dur_us);
+            }
+
             if (close_connection_)
             {
                 adaptor_.shutdown_readwrite();
@@ -327,15 +394,24 @@ namespace crow
 
         void do_write_general()
         {
+            auto socket_start = std::chrono::steady_clock::now();
+            size_t total_transferred = 0;
             error_code ec;
             if (res.body.length() < res_stream_threshold_)
             {
+                total_transferred = res.body.size();
                 res_body_copy_.swap(res.body);
                 buffers_.emplace_back(res_body_copy_.data(), res_body_copy_.size());
 
                 ec = do_write_sync(buffers_);
                 if (ec) {
                     CROW_LOG_ERROR << ec << " - buffer write error happened while sending response. Writing stopped premature.";
+                }
+                auto socket_end = std::chrono::steady_clock::now();
+                int64_t socket_dur_us = std::chrono::duration_cast<std::chrono::microseconds>(socket_end - socket_start).count();
+                if (res.on_socket_complete_)
+                {
+                    res.on_socket_complete_(total_transferred, socket_dur_us);
                 }
                 if (need_to_start_read_after_complete_)
                 {
@@ -367,6 +443,13 @@ namespace crow
                         }
                         transferred += to_transfer;
                     }
+                    total_transferred = length;
+                }
+                auto socket_end = std::chrono::steady_clock::now();
+                int64_t socket_dur_us = std::chrono::duration_cast<std::chrono::microseconds>(socket_end - socket_start).count();
+                if (res.on_socket_complete_)
+                {
+                    res.on_socket_complete_(total_transferred, socket_dur_us);
                 }
                 if (close_connection_)
                 {

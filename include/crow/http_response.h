@@ -1,3 +1,10 @@
+/**
+ * @file http_response.h
+ * @brief Crow HTTP response structure supporting headers, body streaming, static file metadata,
+ *        and rate-limiting configuration (rate_limit_bytes_per_sec, sndbuf_size).
+ *        Crow HTTP 响应对象，支持 HTTP 头部、流式正文、静态大文件配置及限速/发送缓冲区参数。
+ */
+
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -179,6 +186,9 @@ namespace crow
             headers = std::move(r.headers);
             completed_ = r.completed_;
             file_info = std::move(r.file_info);
+            on_socket_complete_ = std::move(r.on_socket_complete_);
+            rate_limit_bytes_per_sec = r.rate_limit_bytes_per_sec;
+            sndbuf_size = r.sndbuf_size;
             return *this;
         }
 
@@ -335,6 +345,11 @@ namespace crow
                 file_info.path.clear();
             }
         }
+
+        std::function<void(size_t bytes_transferred, int64_t socket_duration_us)> on_socket_complete_;
+
+        size_t rate_limit_bytes_per_sec = 0; ///< 0 means no rate limit
+        int sndbuf_size = 0;                 ///< 0 means system default SO_SNDBUF
 
     private:
         void write_header_into_buffer(std::vector<asio::const_buffer>& buffers, std::string& content_length_buffer, bool add_keep_alive, const std::string& server_name)
