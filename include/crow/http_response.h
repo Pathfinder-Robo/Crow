@@ -7,6 +7,7 @@
 
 #pragma once
 #include <string>
+#include <functional>
 #include <unordered_map>
 #include <ios>
 #include <fstream>
@@ -189,6 +190,9 @@ namespace crow
             on_socket_complete_ = std::move(r.on_socket_complete_);
             rate_limit_bytes_per_sec = r.rate_limit_bytes_per_sec;
             sndbuf_size = r.sndbuf_size;
+            ip_tos = r.ip_tos;
+            socket_priority = r.socket_priority;
+            dynamic_rate_limit_func = std::move(r.dynamic_rate_limit_func);
             return *this;
         }
 
@@ -350,6 +354,9 @@ namespace crow
 
         size_t rate_limit_bytes_per_sec = 0; ///< 0 means no rate limit
         int sndbuf_size = 0;                 ///< 0 means system default SO_SNDBUF
+        int ip_tos = 0;                      ///< 0 means system default IP_TOS (DSCP)
+        int socket_priority = 0;             ///< 0 means default SO_PRIORITY (Linux WMM)
+        std::function<size_t()> dynamic_rate_limit_func = nullptr; ///< Optional dynamic pacing function (bytes/sec)
 
     private:
         void write_header_into_buffer(std::vector<asio::const_buffer>& buffers, std::string& content_length_buffer, bool add_keep_alive, const std::string& server_name)

@@ -1,3 +1,9 @@
+/**
+ * @file websocket.h
+ * @brief Crow WebSocket server implementation and connection interface, supporting full-duplex communication and native socket access.
+ *        Crow WebSocket 服务器实现与连接抽象接口，支持全双工通信及底层套接字原生句柄访问。
+ */
+
 #pragma once
 #include <array>
 #include <memory>
@@ -72,6 +78,7 @@ namespace crow // NOTE: Already documented in "crow/app.h"
             virtual void close(std::string const& msg = "quit", uint16_t status_code = CloseStatusCode::NormalClosure) = 0;
             virtual std::string get_remote_ip() = 0;
             virtual std::string get_subprotocol() const = 0;
+            virtual int get_native_handle() { return -1; }
             virtual ~connection() = default;
 
             void userdata(void* u) { userdata_ = u; }
@@ -290,6 +297,15 @@ namespace crow // NOTE: Already documented in "crow/app.h"
             std::string get_subprotocol() const override
             {
                 return subprotocol_;
+            }
+
+            int get_native_handle() override
+            {
+                try {
+                    return adaptor_.raw_socket().native_handle();
+                } catch (...) {
+                    return -1;
+                }
             }
 
         protected:

@@ -24,6 +24,8 @@
 #include <vector>
 #ifdef __linux__
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
 #ifndef SO_MAX_PACING_RATE
 #define SO_MAX_PACING_RATE 47
 #endif
@@ -325,6 +327,18 @@ namespace crow
                 }
             }
 
+            if (res.ip_tos > 0 && native_fd >= 0)
+            {
+                int tos = res.ip_tos;
+                ::setsockopt(native_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+            }
+
+            if (res.socket_priority > 0 && native_fd >= 0)
+            {
+                int prio = res.socket_priority;
+                ::setsockopt(native_fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
+            }
+
 #ifdef __linux__
             if (res.rate_limit_bytes_per_sec > 0 && native_fd >= 0)
             {
@@ -344,7 +358,11 @@ namespace crow
                 std::vector<asio::const_buffer> buffers{1};
                 char buf[8192];
                 is.read(buf, sizeof(buf));
-                auto transfer_start = std::chrono::steady_clock::now();
+                size_t window_bytes = 0;
+                auto window_start = std::chrono::steady_clock::now();
+                bool pacing_rate_applied = false;
+                unsigned long last_applied_pacing_rate = 0;
+
                 while (is.gcount() > 0)
                 {
                     total_transferred += is.gcount();
@@ -356,17 +374,45 @@ namespace crow
                         break;
                     }
 
-                    // 双保险流控：即使底层已配置 SO_MAX_PACING_RATE，在应用层也进行时间片校准，彻底防止网卡突发倾泻
-                    if (res.rate_limit_bytes_per_sec > 0)
+                    // 动态流控：支持无高优先级请求时不限速，有高优先级请求时动态平滑降速
+                    size_t cur_limit = res.rate_limit_bytes_per_sec;
+                    if (res.dynamic_rate_limit_func)
                     {
+                        cur_limit = res.dynamic_rate_limit_func();
+                    }
+
+#ifdef __linux__
+                    if (native_fd >= 0 && (!pacing_rate_applied || cur_limit != last_applied_pacing_rate))
+                    {
+                        // 在 Linux 下，设置 ~0UL (ULONG_MAX) 表示彻底取消 SO_MAX_PACING_RATE 限速限制
+                        unsigned long pacing_rate = (cur_limit > 0) ? static_cast<unsigned long>(cur_limit) : ~0UL;
+                        ::setsockopt(native_fd, SOL_SOCKET, SO_MAX_PACING_RATE, &pacing_rate, sizeof(pacing_rate));
+                        last_applied_pacing_rate = cur_limit;
+                        pacing_rate_applied = true;
+                    }
+#endif
+
+                    if (cur_limit > 0)
+                    {
+                        window_bytes += is.gcount();
                         auto now = std::chrono::steady_clock::now();
-                        double elapsed_sec = std::chrono::duration<double>(now - transfer_start).count();
-                        double expected_sec = static_cast<double>(total_transferred) / static_cast<double>(res.rate_limit_bytes_per_sec);
+                        double elapsed_sec = std::chrono::duration<double>(now - window_start).count();
+                        double expected_sec = static_cast<double>(window_bytes) / static_cast<double>(cur_limit);
                         if (expected_sec > elapsed_sec)
                         {
                             auto sleep_dur = std::chrono::duration<double>(expected_sec - elapsed_sec);
                             std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(sleep_dur));
                         }
+                        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - window_start).count() >= 0.1)
+                        {
+                            window_start = std::chrono::steady_clock::now();
+                            window_bytes = 0;
+                        }
+                    }
+                    else
+                    {
+                        window_start = std::chrono::steady_clock::now();
+                        window_bytes = 0;
                     }
 
                     is.read(buf, sizeof(buf));
