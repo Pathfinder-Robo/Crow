@@ -10,6 +10,14 @@
 #include <optional>
 #include <string>
 #include <thread>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#ifndef TCP_USER_TIMEOUT
+#define TCP_USER_TIMEOUT 18
+#endif
+#endif
 #include "crow/http_response.h"
 #include "crow/logging.h"
 #include "crow/socket_adaptors.h"
@@ -339,6 +347,22 @@ namespace crow // NOTE: Already documented in "crow/app.h"
             /// Finishes the handshake process, then starts reading messages from the socket.
             void start(std::string&& hello)
             {
+#ifdef __linux__
+                try {
+                    int native_fd = adaptor_.raw_socket().native_handle();
+                    if (native_fd >= 0)
+                    {
+                        // WebSocket 采用异步非阻塞写（asio::async_write），单连接抖动不会阻塞其他连接的 Worker 线程；
+                        // 将默认 TCP_USER_TIMEOUT 放宽至 20s（15~25s 区间），容忍手机切后台或短时无线干扰，并与业务心跳配合回收死连接
+                        unsigned int user_timeout_ms = 20000;
+                        ::setsockopt(native_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+                        struct timeval snd_tv;
+                        snd_tv.tv_sec = 20;
+                        snd_tv.tv_usec = 0;
+                        ::setsockopt(native_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
+                    }
+                } catch (...) {}
+#endif
                 static const std::string header =
                   "HTTP/1.1 101 Switching Protocols\r\n"
                   "Upgrade: websocket\r\n"

@@ -26,8 +26,12 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
 #ifndef SO_MAX_PACING_RATE
 #define SO_MAX_PACING_RATE 47
+#endif
+#ifndef TCP_USER_TIMEOUT
+#define TCP_USER_TIMEOUT 18
 #endif
 #endif
 
@@ -113,6 +117,22 @@ namespace crow
             adaptor_.start([self](const error_code& ec) {
                 if (!ec)
                 {
+#ifdef __linux__
+                    try {
+                        int native_fd = self->adaptor_.raw_socket().native_handle();
+                        if (native_fd >= 0)
+                        {
+                            // HTTP 端口默认限制 TCP 未确认重传与阻塞写超时（6s，处于 5~8s 区间），
+                            // 防止客户端直接断电/断 Wi-Fi 造成半开僵尸连接长期卡死同步阻塞的 HTTP Worker 线程
+                            unsigned int user_timeout_ms = 6000;
+                            ::setsockopt(native_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+                            struct timeval snd_tv;
+                            snd_tv.tv_sec = 6;
+                            snd_tv.tv_usec = 0;
+                            ::setsockopt(native_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
+                        }
+                    } catch (...) {}
+#endif
                     self->start_deadline();
                     self->parser_.clear();
 
@@ -340,6 +360,16 @@ namespace crow
             }
 
 #ifdef __linux__
+            if (res.tcp_timeout_sec > 0 && native_fd >= 0)
+            {
+                unsigned int user_timeout_ms = static_cast<unsigned int>(res.tcp_timeout_sec) * 1000U;
+                ::setsockopt(native_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+                struct timeval snd_tv {};
+                snd_tv.tv_sec = res.tcp_timeout_sec;
+                snd_tv.tv_usec = 0;
+                ::setsockopt(native_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
+            }
+
             if (res.rate_limit_bytes_per_sec > 0 && native_fd >= 0)
             {
                 unsigned long pacing_rate = static_cast<unsigned long>(res.rate_limit_bytes_per_sec);
@@ -350,9 +380,16 @@ namespace crow
             }
 #endif
 
-            asio::write(adaptor_.socket(), buffers_);
+            error_code ec_hdr;
+            asio::write(adaptor_.socket(), buffers_, ec_hdr);
+            if (ec_hdr)
+            {
+                CROW_LOG_ERROR << ec_hdr << " - header write error happened while sending static file "
+                               << res.file_info.path << ". Writing stopped premature.";
+                close_connection_ = true;
+            }
 
-            if (res.file_info.statResult == 0)
+            if (!ec_hdr && res.file_info.statResult == 0)
             {
                 std::ifstream is(res.file_info.path.c_str(), std::ios::in | std::ios::binary);
                 std::vector<asio::const_buffer> buffers{1};
@@ -371,6 +408,7 @@ namespace crow
                     if (ec) {
                         CROW_LOG_ERROR << ec << " - buffer write error happened while sending content of file "
                                        << res.file_info.path << ". Writing stopped premature.";
+                        close_connection_ = true;
                         break;
                     }
 
@@ -443,6 +481,23 @@ namespace crow
             auto socket_start = std::chrono::steady_clock::now();
             size_t total_transferred = 0;
             error_code ec;
+#ifdef __linux__
+            if (res.tcp_timeout_sec > 0)
+            {
+                try {
+                    int native_fd = adaptor_.raw_socket().native_handle();
+                    if (native_fd >= 0)
+                    {
+                        unsigned int user_timeout_ms = static_cast<unsigned int>(res.tcp_timeout_sec) * 1000U;
+                        ::setsockopt(native_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+                        struct timeval snd_tv {};
+                        snd_tv.tv_sec = res.tcp_timeout_sec;
+                        snd_tv.tv_usec = 0;
+                        ::setsockopt(native_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
+                    }
+                } catch (...) {}
+            }
+#endif
             if (res.body.length() < res_stream_threshold_)
             {
                 total_transferred = res.body.size();
@@ -452,6 +507,10 @@ namespace crow
                 ec = do_write_sync(buffers_);
                 if (ec) {
                     CROW_LOG_ERROR << ec << " - buffer write error happened while sending response. Writing stopped premature.";
+                    close_connection_ = true;
+                    need_to_start_read_after_complete_ = false;
+                    adaptor_.shutdown_readwrite();
+                    adaptor_.close();
                 }
                 auto socket_end = std::chrono::steady_clock::now();
                 int64_t socket_dur_us = std::chrono::duration_cast<std::chrono::microseconds>(socket_end - socket_start).count();
@@ -468,12 +527,13 @@ namespace crow
             }
             else
             {
-                asio::write(adaptor_.socket(), buffers_,ec); // Write the response start / headers
+                asio::write(adaptor_.socket(), buffers_, ec); // Write the response start / headers
                 if (ec) {
                     CROW_LOG_ERROR << ec << "- buffer write error happened while sending response start / headers. Writing stopped premature.";
+                    close_connection_ = true;
                 }
                 cancel_deadline_timer();
-                if (res.body.length() > 0)
+                if (!ec && res.body.length() > 0)
                 {
                     std::vector<asio::const_buffer> buffers{1};
                     const uint8_t* data = reinterpret_cast<const uint8_t*>(res.body.data());
@@ -485,6 +545,7 @@ namespace crow
                         ec = do_write_sync(buffers);
                         if (ec) {
                             CROW_LOG_ERROR << ec << " - " << transferred << " - buffer write error happened while sending response. Writing stopped premature.";
+                            close_connection_ = true;
                             break;
                         }
                         transferred += to_transfer;

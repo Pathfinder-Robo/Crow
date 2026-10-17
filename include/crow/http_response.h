@@ -192,6 +192,7 @@ namespace crow
             sndbuf_size = r.sndbuf_size;
             ip_tos = r.ip_tos;
             socket_priority = r.socket_priority;
+            tcp_timeout_sec = r.tcp_timeout_sec;
             dynamic_rate_limit_func = std::move(r.dynamic_rate_limit_func);
             return *this;
         }
@@ -209,6 +210,7 @@ namespace crow
             headers.clear();
             completed_ = false;
             file_info = static_file_info{};
+            tcp_timeout_sec = 0;
         }
 
         /// Return a "Temporary Redirect" response.
@@ -356,6 +358,7 @@ namespace crow
         int sndbuf_size = 0;                 ///< 0 means system default SO_SNDBUF
         int ip_tos = 0;                      ///< 0 means system default IP_TOS (DSCP)
         int socket_priority = 0;             ///< 0 means default SO_PRIORITY (Linux WMM)
+        int tcp_timeout_sec = 0;             ///< 0 means keep connection default TCP_USER_TIMEOUT / SO_SNDTIMEO
         std::function<size_t()> dynamic_rate_limit_func = nullptr; ///< Optional dynamic pacing function (bytes/sec)
 
     private:
