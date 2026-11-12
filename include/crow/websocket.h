@@ -6,6 +6,8 @@
 
 #pragma once
 #include <array>
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -87,6 +89,8 @@ namespace crow // NOTE: Already documented in "crow/app.h"
             virtual std::string get_remote_ip() = 0;
             virtual std::string get_subprotocol() const = 0;
             virtual int get_native_handle() { return -1; }
+            using DiagnosticCallback = std::function<void(const std::string&,size_t,double,const std::string&)>;
+            virtual void set_diagnostic_callback(DiagnosticCallback) {}
             virtual ~connection() = default;
 
             void userdata(void* u) { userdata_ = u; }
@@ -259,6 +263,8 @@ namespace crow // NOTE: Already documented in "crow/app.h"
             {
                 send_data(0x2, std::move(msg));
             }
+
+            void set_diagnostic_callback(typename connection::DiagnosticCallback cb) override { diagnostic_callback_=std::move(cb); }
 
             /// Send a plaintext message.
             void send_text(std::string msg) override
@@ -736,11 +742,13 @@ namespace crow // NOTE: Already documented in "crow/app.h"
                     break;
                     case 0x9: // Ping
                     {
+                        if(diagnostic_callback_)diagnostic_callback_("native_ping",fragment_.size(),0,"");
                         send_pong(fragment_);
                     }
                     break;
                     case 0xA: // Pong
                     {
+                        if(diagnostic_callback_)diagnostic_callback_("native_pong",fragment_.size(),0,"");
                         pong_received_ = true;
                     }
                     break;
@@ -767,13 +775,16 @@ namespace crow // NOTE: Already documented in "crow/app.h"
                         buffers.emplace_back(asio::buffer(s));
                     }
                     auto watch = std::weak_ptr<void>{anchor_};
+                    const auto write_start=std::chrono::steady_clock::now();
                     asio::async_write(
                         adaptor_.socket(), buffers,
-                        [shared_this = this->shared_from_this(), watch](const error_code &ec, std::size_t /*bytes_transferred*/) {
+                        [shared_this = this->shared_from_this(), watch,write_start](const error_code &ec, std::size_t bytes_transferred) {
                             auto anchor = watch.lock();
                             if (anchor == nullptr)
                                 return;
 
+                            if(shared_this->diagnostic_callback_)shared_this->diagnostic_callback_(ec?"socket_error":"socket_write_complete",bytes_transferred,
+                                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-write_start).count(),ec?ec.message():"");
                             if (!ec && !shared_this->close_connection_)
                             {
                                 shared_this->sending_buffers_.clear();
@@ -856,6 +867,7 @@ namespace crow // NOTE: Already documented in "crow/app.h"
               accept_handler_(std::move(accept_handler))
             {}
 
+            typename connection::DiagnosticCallback diagnostic_callback_;
             Adaptor adaptor_;
             Handler* handler_;
 

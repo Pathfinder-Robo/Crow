@@ -198,6 +198,11 @@ namespace crow
     class Crow
     {
     public:
+        // Optional diagnostics for interrupted/incomplete HTTP requests.
+        void set_receive_error_handler(std::function<void(const request&,const std::string&)> cb) { receive_error_handler_=std::move(cb); }
+        void handle_receive_error(const request& req,const std::string& error) { if(receive_error_handler_)receive_error_handler_(req,error); }
+        std::function<void(const request&,const std::string&)> receive_error_handler_;
+
         /// \brief This is the crow application
         using self_t = Crow;
 

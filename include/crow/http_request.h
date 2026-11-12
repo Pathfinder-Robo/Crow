@@ -40,6 +40,7 @@ namespace crow // NOTE: Already documented in "crow/app.h"
         std::string url;         ///< The endpoint without any parameters.
         query_string url_params; ///< The parameters associated with the request. (everything after the `?` in the URL)
         ci_map headers;
+        uint64_t receive_start_mono_us = 0, receive_last_mono_us = 0, receive_start_wall_ms = 0;
         std::string body;
         std::string remote_ip_address; ///< The IP address from which the request was sent.
         unsigned char http_ver_major, http_ver_minor;

@@ -581,6 +581,14 @@ namespace crow
                   bool error_while_reading = true;
                   if (!ec)
                   {
+                      const auto rx_now = std::chrono::steady_clock::now();
+                      const auto rx_us = std::chrono::duration_cast<std::chrono::microseconds>(rx_now.time_since_epoch()).count();
+                      if (!self->req_.receive_start_mono_us) {
+                          self->req_.receive_start_mono_us = rx_us;
+                          self->req_.remote_ip_address = self->adaptor_.address();
+                          self->req_.receive_start_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                      }
+                      self->req_.receive_last_mono_us = rx_us;
                       bool ret = self->parser_.feed(self->buffer_.data(), bytes_transferred);
                       if (ret && self->adaptor_.is_open())
                       {
@@ -590,6 +598,7 @@ namespace crow
 
                   if (error_while_reading)
                   {
+                      if(self->req_.receive_start_mono_us)self->handler_->handle_receive_error(self->req_,ec?ec.message():"HTTP parse failure");
                       self->cancel_deadline_timer();
                       self->parser_.done();
                       self->adaptor_.shutdown_read();
